@@ -14,6 +14,11 @@ from app.utils.jwt_handler import get_current_user
 router = APIRouter()
 security = HTTPBearer()
 
+
+class AceptarServicioPayload(BaseModel):
+    proveedor_id: str
+
+
 USUARIOS_API_BASE_URL = os.getenv(
     "USUARIOS_API_BASE_URL", "https://usuarios-api-2d5af8f6584a.herokuapp.com"
 )
@@ -393,7 +398,3 @@ async def asignar_creditos(datos: Transaccion, user_id: str = Depends(get_curren
         "mensaje": f"Se asignaron {datos.monto} créditos al usuario {datos.id_receptor}",
         "transaccion": {**nueva_transaccion, "_id": str(result.inserted_id)},
     }
-
-
-class AceptarServicioPayload(BaseModel):
-    proveedor_id: str
