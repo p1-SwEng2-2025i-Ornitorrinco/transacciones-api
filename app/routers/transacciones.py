@@ -1,177 +1,293 @@
-from fastapi import APIRouter, Request, HTTPException, Depends, Header
-from fastapi.security import HTTPBearer
-from app.models.transaccion import Transaccion
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from app.db.mongo import transacciones_collection, usuarios_collection, client
-from app.utils.jwt_handler import SECRET_KEY, ALGORITHM
-from app.utils.jwt_handler import verificar_token, verificar_admin
-from app.utils.jwt_handler import get_current_user
-from app.models.transaccion import Transaccion 
-from jose import jwt,JWTError
-from bson import ObjectId
+import os
 from datetime import datetime
 from typing import Optional
+
+from bson import ObjectId
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.security import HTTPBearer
+
+from app.db.mongo import client, transacciones_collection, usuarios_collection
+from app.models.transaccion import ServicioTransaccion, Transaccion
+from app.utils.jwt_handler import get_current_user
 
 router = APIRouter()
 security = HTTPBearer()
 
-async def verificar_admin(user_id: str = Depends(get_current_user)):
-    usuario = await usuarios_collection.find_one({"_id": ObjectId(user_id)})
-    if not usuario or usuario.get("rol") != "admin":
-        raise HTTPException(status_code=403, detail="Acceso restringido a administradores")
-    return user_id
+USUARIOS_API_BASE_URL = os.getenv(
+    "USUARIOS_API_BASE_URL", "https://usuarios-api-2d5af8f6584a.herokuapp.com"
+)
 
-async def ejecutar_transaccion(
-    id_emisor: Optional[str],
-    id_receptor: str,
-    monto: float,
-    tipo: str,
-    justificacion: Optional[str] = None,
-    id_servicio: Optional[str] = None,
-    session=None
-):
-    """Función reusable para lógica transaccional"""
-    # Validar usuarios
-    if id_emisor:
-        emisor = await usuarios_collection.find_one(
-            {"_id": id_emisor},
-            session=session
-        )
-        if not emisor:
-            raise ValueError("Emisor no encontrado")
-        if emisor.get("saldo", 0) < monto:
-            raise ValueError("Saldo insuficiente")
 
-    receptor = await usuarios_collection.find_one(
-        {"_id": id_receptor},
-        session=session
-    )
-    if not receptor:
-        raise ValueError("Receptor no encontrado")
+def _build_avatar_url(foto_url: Optional[str]) -> Optional[str]:
+    """Devuelve la URL completa de la foto de perfil."""
+    if not foto_url:
+        return None
+    if foto_url.startswith("http"):
+        return foto_url
+    if foto_url.startswith("/"):
+        return f"{USUARIOS_API_BASE_URL}{foto_url}"
+    return foto_url
 
-    # Actualizar saldos
-    if id_emisor:
-        await usuarios_collection.update_one(
-            {"_id": id_emisor},
-            {"$inc": {"saldo": -monto}},
-            session=session
-        )
 
-    await usuarios_collection.update_one(
-        {"_id": id_receptor},
-        {"$inc": {"saldo": monto}},
-        session=session
-    )
+async def _obtener_usuario(user_id: str, session=None):
+    if not ObjectId.is_valid(user_id):
+        raise HTTPException(status_code=400, detail="ID de usuario inválido")
 
-    # Registrar transacción
-    transaccion_data = {
-        "id_emisor": id_emisor,
-        "id_receptor": id_receptor,
-        "monto": monto,
-        "tipo": tipo,
-        "fecha": datetime.utcnow(),
-        "id_servicio": id_servicio,
-        "justificacion": justificacion
-    }
+    usuario = await usuarios_collection.find_one({"_id": ObjectId(user_id)}, session=session)
+    if not usuario:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    return usuario
 
-    result = await transacciones_collection.insert_one(
-        transaccion_data,
-        session=session
-    )
-    
-    return str(result.inserted_id)
+
+async def _build_counterparty(user_id: str):
+    try:
+        usuario = await _obtener_usuario(user_id)
+        nombre = f"{usuario.get('nombres', '')} {usuario.get('apellidos', '')}".strip()
+        return {
+            "id": user_id,
+            "name": nombre or "Usuario",
+            "avatar": _build_avatar_url(usuario.get("foto_url")) or "",
+        }
+    except HTTPException:
+        # Si el usuario ya no existe, devolvemos datos mínimos
+        return {"id": user_id, "name": "Usuario", "avatar": ""}
+
 
 @router.get("/saldo/{user_id}")
 async def obtener_saldo(user_id: str):
-    usuario = await usuarios_collection.find_one({"_id": user_id})
-    if not usuario:
-        raise HTTPException(status_code=404, detail="Usuario no encontrado")
-    return {"saldo": usuario.get("saldo", 0)}
+    usuario = await _obtener_usuario(user_id)
+    return {"saldo": float(usuario.get("saldo_creditos", 0.0))}
+
 
 @router.get("/transacciones/historial/{user_id}")
 async def historial_transacciones(user_id: str):
-    cursor = transacciones_collection.find({
-        "$or": [
-            {"id_emisor": user_id},
-            {"id_receptor": user_id}
-        ]
-    }).sort("fecha", -1)
+    cursor = (
+        transacciones_collection.find(
+            {
+                "$or": [
+                    {"id_emisor": user_id},
+                    {"id_receptor": user_id},
+                ]
+            }
+        )
+        .sort("fecha", -1)
+    )
+
     historial = []
     async for transaccion in cursor:
-        transaccion["_id"] = str(transaccion["_id"])
-        historial.append(transaccion)
+        tipo_original = transaccion.get("tipo", "transferencia")
+
+        if tipo_original == "asignacion" or transaccion.get("id_emisor") == "admin":
+            tipo = "bonus"
+        elif transaccion.get("id_receptor") == user_id:
+            tipo = "received"
+        else:
+            tipo = "sent"
+
+        if tipo == "bonus":
+            contraparte_id = transaccion.get("id_emisor")
+        elif tipo == "received":
+            contraparte_id = transaccion.get("id_emisor")
+        else:
+            contraparte_id = transaccion.get("id_receptor")
+        historial.append(
+            {
+                "id": str(transaccion.get("_id")),
+                "type": tipo,
+                "amount": float(transaccion.get("monto", 0)),
+                "date": (
+                    transaccion.get("fecha").isoformat()
+                    if transaccion.get("fecha")
+                    else datetime.utcnow().isoformat()
+                ),
+                "description": transaccion.get("justificacion") or tipo_original,
+                "status": transaccion.get("estado", "completed"),
+                "counterparty": await _build_counterparty(contraparte_id)
+                if contraparte_id
+                else None,
+                "id_servicio": transaccion.get("id_servicio"),
+            }
+        )
     return historial
 
-@router.post("/transacciones/transferir", response_model=Transaccion)
+
+@router.get("/transacciones/servicios/{user_id}")
+async def historial_servicios(user_id: str):
+    cursor = (
+        transacciones_collection.find(
+            {
+                "tipo": "servicio",
+                "$or": [
+                    {"id_emisor": user_id},
+                    {"id_receptor": user_id},
+                ],
+            }
+        )
+        .sort("fecha", -1)
+    )
+
+    contratados = []
+    prestados = []
+
+    async for transaccion in cursor:
+        es_contratado = transaccion.get("id_emisor") == user_id
+        contraparte_id = (
+            transaccion.get("id_receptor")
+            if es_contratado
+            else transaccion.get("id_emisor")
+        )
+
+        item = {
+            "id": str(transaccion.get("_id")),
+            "servicio_id": transaccion.get("id_servicio"),
+            "titulo": transaccion.get("servicio_titulo")
+            or transaccion.get("justificacion")
+            or "Servicio",
+            "fecha": (
+                transaccion.get("fecha").isoformat()
+                if transaccion.get("fecha")
+                else datetime.utcnow().isoformat()
+            ),
+            "estado": transaccion.get("estado", "completed"),
+            "monto": float(transaccion.get("monto", 0)),
+            "contraparte": await _build_counterparty(contraparte_id)
+            if contraparte_id
+            else None,
+        }
+
+        if es_contratado:
+            contratados.append(item)
+        else:
+            prestados.append(item)
+
+    return {"contratados": contratados, "prestados": prestados}
+
+
+@router.post("/transacciones/servicio")
+async def pagar_servicio(payload: ServicioTransaccion):
+    comprador = await _obtener_usuario(payload.comprador_id)
+    proveedor = await _obtener_usuario(payload.proveedor_id)
+
+    if payload.comprador_id == payload.proveedor_id:
+        raise HTTPException(
+            status_code=400, detail="No puedes pagar un servicio a tu propio usuario"
+        )
+
+    saldo_actual = float(comprador.get("saldo_creditos", 0.0))
+    if saldo_actual < payload.monto:
+        raise HTTPException(status_code=400, detail="Saldo insuficiente")
+
+    transaccion_doc = {
+        "id_emisor": payload.comprador_id,
+        "id_receptor": payload.proveedor_id,
+        "monto": payload.monto,
+        "tipo": "servicio",
+        "id_servicio": payload.servicio_id,
+        "servicio_titulo": payload.descripcion,
+        "justificacion": payload.descripcion or "Pago de servicio",
+        "estado": payload.estado or "completed",
+        "fecha": datetime.utcnow(),
+    }
+
+    async with await client.start_session() as session:
+        async with session.start_transaction():
+            await usuarios_collection.update_one(
+                {"_id": ObjectId(payload.comprador_id)},
+                {"$inc": {"saldo_creditos": -payload.monto}},
+                session=session,
+            )
+            await usuarios_collection.update_one(
+                {"_id": ObjectId(payload.proveedor_id)},
+                {"$inc": {"saldo_creditos": payload.monto}},
+                session=session,
+            )
+            result = await transacciones_collection.insert_one(
+                transaccion_doc, session=session
+            )
+            transaccion_doc["_id"] = str(result.inserted_id)
+
+    return {
+        "id": transaccion_doc["_id"],
+        "nuevo_saldo": saldo_actual - payload.monto,
+        "transaccion": transaccion_doc,
+    }
+
+
+@router.post("/transacciones/transferir")
 async def transferir_creditos(datos: Transaccion, user_id: str = Depends(get_current_user)):
-    # Validar que el usuario autenticado sea quien transfiere
     if user_id != datos.id_emisor:
         raise HTTPException(status_code=403, detail="No puedes transferir como otro usuario")
 
-    # Validar IDs
-    if not ObjectId.is_valid(datos.id_emisor) or not ObjectId.is_valid(datos.id_receptor):
-        raise HTTPException(status_code=400, detail="ID inválido")
+    emisor = await _obtener_usuario(datos.id_emisor)
+    receptor = await _obtener_usuario(datos.id_receptor)
 
-    emisor = await usuarios_collection.find_one({"_id": ObjectId(datos.id_emisor)})
-    receptor = await usuarios_collection.find_one({"_id": ObjectId(datos.id_receptor)})
-
-    if not emisor or not receptor:
-        raise HTTPException(status_code=404, detail="Emisor o receptor no encontrado")
-
-    # Obtener saldos actuales (inicializar si no existen)
-    moneda_emisor = emisor.get("moneda_virtual", {})
-    saldo_emisor = moneda_emisor.get("saldo", 0.0)
-
-    moneda_receptor = receptor.get("moneda_virtual", {})
-    saldo_receptor = moneda_receptor.get("saldo", 0.0)
-
-    # Validar saldo suficiente
+    saldo_emisor = float(emisor.get("saldo_creditos", 0.0))
     if saldo_emisor < datos.monto:
         raise HTTPException(status_code=400, detail="Saldo insuficiente")
 
-    # Registrar transacción
-    transaccion_dict = datos.dict()
-    transaccion_dict["fecha"] = datos.fecha or datetime.utcnow()
+    transaccion_doc = {
+        "id_emisor": datos.id_emisor,
+        "id_receptor": datos.id_receptor,
+        "monto": datos.monto,
+        "tipo": datos.tipo or "transferencia",
+        "estado": datos.estado or "completed",
+        "justificacion": datos.justificacion,
+        "fecha": datos.fecha or datetime.utcnow(),
+    }
 
-    await transacciones_collection.insert_one(transaccion_dict)
+    async with await client.start_session() as session:
+        async with session.start_transaction():
+            await usuarios_collection.update_one(
+                {"_id": ObjectId(datos.id_emisor)},
+                {"$inc": {"saldo_creditos": -datos.monto}},
+                session=session,
+            )
+            await usuarios_collection.update_one(
+                {"_id": ObjectId(datos.id_receptor)},
+                {"$inc": {"saldo_creditos": datos.monto}},
+                session=session,
+            )
+            result = await transacciones_collection.insert_one(
+                transaccion_doc, session=session
+            )
+            transaccion_doc["_id"] = str(result.inserted_id)
 
-    # Actualizar saldo emisor
-    await usuarios_collection.update_one(
-        {"_id": ObjectId(datos.id_emisor)},
-        {"$set": {
-            "moneda_virtual.saldo": saldo_emisor - datos.monto,
-            "moneda_virtual.ultima_actualizacion": datetime.utcnow()
-        }}
-    )
-
-    # Actualizar saldo receptor
-    await usuarios_collection.update_one(
-        {"_id": ObjectId(datos.id_receptor)},
-        {"$set": {
-            "moneda_virtual.saldo": saldo_receptor + datos.monto,
-            "moneda_virtual.ultima_actualizacion": datetime.utcnow()
-        }}
-    )
-
-    return datos
-
+    return transaccion_doc
 
 
 @router.post("/admin/asignar_creditos")
-async def asignar_creditos(datos: Transaccion, usuario=Depends(verificar_admin)):
-    if not datos.justificacion or not datos.id_receptor:
-        raise HTTPException(status_code=400, detail="Falta justificación o receptor")
+async def asignar_creditos(datos: Transaccion, user_id: str = Depends(get_current_user)):
+    admin = await _obtener_usuario(user_id)
+    if admin.get("rol") != "admin":
+        raise HTTPException(status_code=403, detail="Acceso restringido a administradores")
 
-    await usuarios_collection.update_one({"_id": datos.id_receptor}, {"$inc": {"saldo": datos.monto}})
+    if not datos.id_receptor:
+        raise HTTPException(status_code=400, detail="Falta receptor")
 
-    nueva_transaccion = datos.dict()
-    nueva_transaccion["tipo"] = "asignacion"
-    nueva_transaccion["fecha"] = datetime.utcnow()
-    nueva_transaccion["id_emisor"] = "admin"
+    await _obtener_usuario(datos.id_receptor)  # valida existencia
 
-    await transacciones_collection.insert_one(nueva_transaccion)
+    nueva_transaccion = {
+        "id_emisor": "admin",
+        "id_receptor": datos.id_receptor,
+        "monto": datos.monto,
+        "tipo": "asignacion",
+        "estado": datos.estado or "completed",
+        "fecha": datetime.utcnow(),
+        "justificacion": datos.justificacion or "Asignación de créditos",
+    }
 
-    return {"mensaje": f"Se asignaron {datos.monto} créditos al usuario {datos.id_receptor}"}
+    async with await client.start_session() as session:
+        async with session.start_transaction():
+            await usuarios_collection.update_one(
+                {"_id": ObjectId(datos.id_receptor)},
+                {"$inc": {"saldo_creditos": datos.monto}},
+                session=session,
+            )
+            result = await transacciones_collection.insert_one(
+                nueva_transaccion, session=session
+            )
 
-
-
+    return {
+        "mensaje": f"Se asignaron {datos.monto} créditos al usuario {datos.id_receptor}",
+        "transaccion": {**nueva_transaccion, "_id": str(result.inserted_id)},
+    }
