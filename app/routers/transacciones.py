@@ -5,6 +5,7 @@ from typing import Optional
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.security import HTTPBearer
+from pydantic import BaseModel
 
 from app.db.mongo import client, transacciones_collection, usuarios_collection
 from app.models.transaccion import ServicioTransaccion, Transaccion
@@ -213,6 +214,107 @@ async def pagar_servicio(payload: ServicioTransaccion):
     }
 
 
+@router.post("/transacciones/servicio/solicitar")
+async def solicitar_servicio(payload: ServicioTransaccion):
+    # Valida usuarios pero no mueve saldos todavía
+    await _obtener_usuario(payload.comprador_id)
+    await _obtener_usuario(payload.proveedor_id)
+
+    transaccion_doc = {
+        "id_emisor": payload.comprador_id,
+        "id_receptor": payload.proveedor_id,
+        "monto": payload.monto,
+        "tipo": "servicio",
+        "id_servicio": payload.servicio_id,
+        "servicio_titulo": payload.descripcion,
+        "justificacion": payload.descripcion or "Solicitud de servicio",
+        "estado": "pending",
+        "fecha": datetime.utcnow(),
+    }
+    result = await transacciones_collection.insert_one(transaccion_doc)
+    transaccion_doc["_id"] = str(result.inserted_id)
+    return transaccion_doc
+
+
+@router.get("/transacciones/servicio/pendientes/{proveedor_id}")
+async def solicitudes_pendientes(proveedor_id: str):
+    cursor = transacciones_collection.find(
+        {"tipo": "servicio", "estado": "pending", "id_receptor": proveedor_id}
+    ).sort("fecha", -1)
+
+    solicitudes = []
+    async for t in cursor:
+        solicitudes.append(
+            {
+                "id": str(t.get("_id")),
+                "servicio_id": t.get("id_servicio"),
+                "titulo": t.get("servicio_titulo") or t.get("justificacion") or "Servicio",
+                "fecha": t.get("fecha").isoformat() if t.get("fecha") else datetime.utcnow().isoformat(),
+                "estado": t.get("estado", "pending"),
+                "monto": float(t.get("monto", 0)),
+                "contraparte": await _build_counterparty(t.get("id_emisor")),
+            }
+        )
+    return solicitudes
+
+
+@router.post("/transacciones/servicio/{transaccion_id}/aceptar")
+async def aceptar_servicio(transaccion_id: str, payload: AceptarServicioPayload):
+    if not ObjectId.is_valid(transaccion_id):
+        raise HTTPException(status_code=400, detail="ID de transacción inválido")
+
+    transaccion = await transacciones_collection.find_one({"_id": ObjectId(transaccion_id)})
+    if not transaccion:
+        raise HTTPException(status_code=404, detail="Transacción no encontrada")
+
+    if transaccion.get("tipo") != "servicio":
+        raise HTTPException(status_code=400, detail="La transacción no es de tipo servicio")
+
+    if transaccion.get("estado") != "pending":
+        raise HTTPException(status_code=400, detail="La solicitud ya fue gestionada")
+
+    if transaccion.get("id_receptor") != payload.proveedor_id:
+        raise HTTPException(status_code=403, detail="No puedes aceptar esta solicitud")
+
+    comprador_id = transaccion.get("id_emisor")
+    proveedor_id = transaccion.get("id_receptor")
+    monto = float(transaccion.get("monto", 0))
+
+    comprador = await _obtener_usuario(comprador_id)
+    _ = await _obtener_usuario(proveedor_id)
+
+    saldo_actual = float(comprador.get("saldo_creditos", 0.0))
+    if saldo_actual < monto:
+        raise HTTPException(status_code=400, detail="Saldo insuficiente para completar el pago")
+
+    async with await client.start_session() as session:
+        async with session.start_transaction():
+            await usuarios_collection.update_one(
+                {"_id": ObjectId(comprador_id)},
+                {"$inc": {"saldo_creditos": -monto}},
+                session=session,
+            )
+            await usuarios_collection.update_one(
+                {"_id": ObjectId(proveedor_id)},
+                {"$inc": {"saldo_creditos": monto}},
+                session=session,
+            )
+            await transacciones_collection.update_one(
+                {"_id": ObjectId(transaccion_id)},
+                {
+                    "$set": {
+                        "estado": "completed",
+                        "fecha": datetime.utcnow(),
+                    }
+                },
+                session=session,
+            )
+
+    transaccion_actualizada = await transacciones_collection.find_one({"_id": ObjectId(transaccion_id)})
+    transaccion_actualizada["_id"] = str(transaccion_actualizada["_id"])
+    return transaccion_actualizada
+
+
 @router.post("/transacciones/transferir")
 async def transferir_creditos(datos: Transaccion, user_id: str = Depends(get_current_user)):
     if user_id != datos.id_emisor:
@@ -291,3 +393,7 @@ async def asignar_creditos(datos: Transaccion, user_id: str = Depends(get_curren
         "mensaje": f"Se asignaron {datos.monto} créditos al usuario {datos.id_receptor}",
         "transaccion": {**nueva_transaccion, "_id": str(result.inserted_id)},
     }
+
+
+class AceptarServicioPayload(BaseModel):
+    proveedor_id: str
