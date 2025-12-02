@@ -39,7 +39,7 @@ app.include_router(admin.router)
 
 @app.get("/")
 def root():
-    return {"mensaje": "API de gestión de créditos y transacciones"}
+    return {"mensaje": "API de gestión de créditos y transacciones hola como estassss"}
 
 # Manejo de errores (igual que antes)
 @app.exception_handler(RequestValidationError)
