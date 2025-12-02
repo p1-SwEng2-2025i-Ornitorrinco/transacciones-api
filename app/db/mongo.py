@@ -1,6 +1,7 @@
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ASCENDING
 import os
+import motor.motor_asyncio
 
 MONGO_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017")  # usa Atlas si existe
 client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
