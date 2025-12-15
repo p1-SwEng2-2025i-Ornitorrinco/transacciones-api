@@ -1,0 +1,30 @@
+services:
+  prometheus:
+    image: prom/prometheus:v2.47.2
+    platform: linux/amd64
+    user: "65534:65534"  # UID/GID oficial de Prometheus
+    volumes:
+      - prometheus_data:/prometheus
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    command: [
+      "--config.file=/etc/prometheus/prometheus.yml",
+      "--storage.tsdb.path=/prometheus",
+      "--web.console.templates=/etc/prometheus/consoles",
+      "--web.console.libraries=/etc/prometheus/console_libraries",
+      "--storage.tsdb.retention.time=15d"
+    ]
+  grafana:
+    image: grafana/grafana:latest
+    platform: linux/amd64
+    user: "472:472"  # UID oficial de Grafana
+    volumes:
+      - type: bind
+        source: ./grafana_data
+        target: /var/lib/grafana
+    ports:
+      - "3001:3000"
+    restart: unless-stopped
+volumes:
+  prometheus_data:
