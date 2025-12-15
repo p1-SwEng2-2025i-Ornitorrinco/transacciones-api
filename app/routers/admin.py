@@ -22,19 +22,14 @@ async def asignar_creditos_admin(data: AsignacionCreditoRequest, user_id: str = 
     if not usuario:
         raise HTTPException(status_code=404, detail="Usuario no encontrado")
 
-    # Calcular nuevo saldo
-    # Obtener el campo moneda_virtual o inicializarlo
-    moneda = usuario.get("moneda_virtual", {})
-    saldo_actual = moneda.get("saldo", 0.0)
-
+    saldo_actual = float(usuario.get("saldo_creditos", 0.0))
     nuevo_saldo = saldo_actual + data.monto
 
-    # Si no existía, se crea desde cero con el nuevo saldo
     await usuarios_collection.update_one(
         {"_id": ObjectId(data.usuario_id)},
         {
             "$set": {
-                "moneda_virtual.saldo": nuevo_saldo,
+                "saldo_creditos": nuevo_saldo,
                 "moneda_virtual.ultima_actualizacion": datetime.utcnow()
             }
         }

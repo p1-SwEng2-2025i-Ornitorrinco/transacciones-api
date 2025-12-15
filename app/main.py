@@ -20,10 +20,10 @@ import traceback
 app = FastAPI(title="API de Transacciones y Moneda Virtual")
 security = HTTPBearer()
 
-# Configuración de CORS 
+# 🔵 Añadir middleware de CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=["*"],  
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -39,7 +39,7 @@ app.include_router(admin.router)
 
 @app.get("/")
 def root():
-    return {"mensaje": "API de gestión de créditos y transacciones"}
+    return {"mensaje": "API de gestión de créditos y transacciones hola como estassss"}
 
 # Manejo de errores (igual que antes)
 @app.exception_handler(RequestValidationError)
